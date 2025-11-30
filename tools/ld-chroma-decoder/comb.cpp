@@ -392,32 +392,215 @@ void Comb::FrameBuffer::split2D()
     }
 }
 
-// Extract chroma into clpbuffer[2] using an adaptive 3D filter.
-//
-// For each sample, this builds a list of candidates from other positions that
-// should have a 180 degree phase relationship to the current sample, and look
-// like they have similar luma/chroma content. It then picks the most similar
-// candidate.
+// Extract chroma into clpbuffer[2] using an transform 3D filter.
+// By asdfqazsnbb
+#include <fftw3.h>
+#include <vector>
+#include <complex>
+#include <cmath>
+#include <algorithm>
+
+
+#ifndef IDX3
+#define IDX3(t, y, x, Nt, Ny, Nx) ((t)*(Ny)*(Nx) + (y)*(Nx) + (x))
+#endif
+
 void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame, const FrameBuffer &nextFrame)
 {
-    for (qint32 lineNumber = videoParameters.firstActiveFrameLine; lineNumber < videoParameters.lastActiveFrameLine; lineNumber++) {
-        for (qint32 h = videoParameters.activeVideoStart; h < videoParameters.activeVideoEnd; h++) {
-            // Select the best candidate
-            qint32 bestIndex;
-            double bestSample;
-            getBestCandidate(lineNumber, h, previousFrame, nextFrame, bestIndex, bestSample);
+    // =========================================================================
+    // 1. 参数配置 Parameter Configuration
+    // =========================================================================
+    const int Nx = 16;
+    const int Ny = 16;
+    const int Nt = 3; 
 
-            if (bestIndex < CAND_PREV_FIELD) {
-                // A 1D or 2D candidate was best.
-                // Use split2D's output, to save duplicating the line-blending heuristics here.
-                clpbuffer[2].pixel[lineNumber][h] = clpbuffer[1].pixel[lineNumber][h];
-            } else {
-                // Compute a 3D result.
-                // This sample is Y + C; the candidate is (ideally) Y - C. So compute C as ((Y + C) - (Y - C)) / 2.
-                clpbuffer[2].pixel[lineNumber][h] = (clpbuffer[0].pixel[lineNumber][h] - bestSample) / 2;
+    const int STEP_X = 4; // 75% 重叠 Overlap
+    const int STEP_Y = 4;
+
+    const int SC_X = 4; // Bin 4
+    const int SC_Y = 8; // Bin 8
+
+    // =========================================================================
+    // 2. 初始化 Initialization FFTW
+    // =========================================================================
+    fftw_complex *in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
+    fftw_complex *out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
+
+    fftw_plan p_fwd = fftw_plan_dft_3d(Nt, Ny, Nx, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+    fftw_plan p_inv = fftw_plan_dft_3d(Nt, Ny, Nx, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+    std::vector<double> winX(Nx), winY(Ny), winT(Nt);
+    for(int i=0; i<Nx; ++i) winX[i] = 0.5 * (1.0 - cos(2.0 * M_PI * i / (Nx - 1)));
+    for(int i=0; i<Ny; ++i) winY[i] = 0.5 * (1.0 - cos(2.0 * M_PI * i / (Ny - 1)));
+    winT[0] = 0.5; winT[1] = 1.0; winT[2] = 0.5;
+
+    int width = videoParameters.activeVideoEnd;
+    int height = videoParameters.lastActiveFrameLine;
+    
+    std::vector<std::vector<double>> accChroma(height, std::vector<double>(width, 0.0));
+    std::vector<std::vector<double>> weightSum(height, std::vector<double>(width, 0.0));
+
+    // =========================================================================
+    // 3. 3D 块处理循环 3D Block Processing Loop
+    // =========================================================================
+    int startY = videoParameters.firstActiveFrameLine;
+    int endY = videoParameters.lastActiveFrameLine - Ny;
+    int startX = videoParameters.activeVideoStart;
+    int endX = videoParameters.activeVideoEnd - Nx;
+
+    const FrameBuffer* frames[3] = {&previousFrame, this, &nextFrame};
+
+    for (int y = startY; y <= endY; y += STEP_Y) {
+        for (int x = startX; x <= endX; x += STEP_X) {
+
+            // --- A. 装载 3D 数据块 (DC 移除 - 必不可少) ---  Load 3D blocks (DC removal - essential) 
+            double blockDC = 0.0;
+            for (int t = 0; t < Nt; ++t) {
+                for (int dy = 0; dy < Ny; ++dy) {
+                    const quint16 *lineData = frames[t]->rawbuffer.data() + ((y + dy) * videoParameters.fieldWidth);
+                    for (int dx = 0; dx < Nx; ++dx) {
+                        blockDC += (double)lineData[x + dx];
+                    }
+                }
+            }
+            blockDC /= (double)(Nt * Ny * Nx);
+
+            for (int t = 0; t < Nt; ++t) {
+                for (int dy = 0; dy < Ny; ++dy) {
+                    const quint16 *lineData = frames[t]->rawbuffer.data() + ((y + dy) * videoParameters.fieldWidth);
+                    for (int dx = 0; dx < Nx; ++dx) {
+                        int idx = IDX3(t, dy, dx, Nt, Ny, Nx);
+                        double val = (double)lineData[x + dx];
+                        in[idx][0] = (val - blockDC) * winT[t] * winY[dy] * winX[dx];
+                        in[idx][1] = 0.0;
+                    }
+                }
+            }
+
+            // --- B. 3D FFT ---
+            fftw_execute(p_fwd);
+
+            // --- C. 3D LUT & NTSC Logic ---
+            for (int t = 0; t < Nt; ++t) {
+                for (int fy = 0; fy < Ny; ++fy) {
+                    int real_fy = (fy <= Ny/2) ? fy : (Ny - fy);
+
+                    for (int fx = 0; fx < Nx; ++fx) {
+                        int idx = IDX3(t, fy, fx, Nt, Ny, Nx);
+                        
+                        double mag = sqrt(out[idx][0]*out[idx][0] + out[idx][1]*out[idx][1]);
+                        double gain = 0.0; // 默认是亮度，除非证明是色度 The default is luminance, unless proven to be chrominance.
+
+                        // =====================================================
+                        // 1. 核心保护 (Core Protection) - 消除网点 (Eliminate Dots)
+                        // =====================================================
+                        // 真正的 NTSC 色度位于 (fx=4, fy=8, t!=0)。 NTSC chrominance is located at (fx=4, fy=8, t!=0)
+                        // 这是一个"靶心"。如果信号落在这里，它 99.9% 是颜色。 This is the target. If the signal lands here, it's 99.9% likely to be color.
+                        // 我们不需要检查对称性，直接放行，防止因为微小不对称导致 gain<1.0 而残留网点。 
+                        // We do not need to check for symmetry; proceed directly to prevent residual dots caused by minor asymmetries resulting in gain < 1.0.
+                        
+                        bool is_chroma_core_x = (fx >= 3 && fx <= 5); // 水平中心 Horizontal Center
+                        bool is_chroma_core_y = (real_fy >= 6);       // 垂直高频 (接近8) Vertical High Frequency (Approximately 8) 
+                        bool is_motion = (t != 0);                    // 时间动态 Temporal movement
+
+                        if (is_chroma_core_x && is_chroma_core_y && is_motion) {
+                            // 命中靶心！直接满增益。Bullseye! Full gains instantly.
+                            gain = 1.0; 
+                        }
+                        else {
+                            // =================================================
+                            // 2. 边缘区域 (Symmetry Check) - 消除锯齿 (Eliminate Jaggies)
+                            // =================================================
+                            // 如果不在靶心，我们需要严格检查对称性。If it is not in the bullseye, we need to rigorously examine the symmetry.
+                            
+                            if (mag > 0.001) {
+                                int ref_fx = (2 * SC_X - fx + Nx) % Nx;
+                                int ref_fy = (2 * SC_Y - fy + Ny) % Ny;
+                                int ref_t = (t == 1) ? 2 : ((t == 2) ? 1 : t);
+
+                                int ref_idx = IDX3(ref_t, ref_fy, ref_fx, Nt, Ny, Nx);
+                                double ref_mag = sqrt(out[ref_idx][0]*out[ref_idx][0] + out[ref_idx][1]*out[ref_idx][1]);
+
+                                double ratio = ref_mag / mag;
+                                if (ratio > 1.0) ratio = 1.0 / ratio;
+
+                                // [修正] 收紧阈值，减少模糊区域
+                                // 之前的 soft slope (0.2-0.8) 太宽了，导致边缘不干脆。
+                                // 改回较陡的曲线 (0.4-0.8)，或者甚至是专利图 4 的风格。
+                                if (ratio > 0.75) gain = 1.0;
+                                else if (ratio < 0.4) gain = 0.0;
+                                else gain = (ratio - 0.4) / 0.35;
+                            }
+                        }
+
+                        // ===========================================================
+                        // 3. NTSC 陷阱 (Hard Traps) - 消除彩虹 (Eliminate the rainbow)
+                        // ===========================================================
+                        // 这里的规则必须是"一票否决" The rule here must be a “veto power.”
+                        
+                        // Trap A: 静态信号 (t=0) Static signal
+                        if (t == 0) {
+                            if (fx >= 2 && fx <= 6) gain = 0.0;
+                        }
+                        
+                        // Trap B: 水平低频 Low horizontal frequency
+                        if (fx < 2) gain = 0.0;
+
+                        // Trap D: 垂直低频 (Vertical Stripes)
+                        // 如果垂直方向没变化 (fy <= 1) 且水平是高频 -> 绝对是垂直条纹亮度。
+                        // If the vertical direction remains unchanged (fy ≤ 1) and the horizontal direction is high-frequency -> it is definitely vertical stripe brightness.
+                        if (real_fy <= 1 && fx >= 2) {
+                            gain = 0.0;
+                        }
+
+
+                        // 4. 应用增益 Applied gain
+                        out[idx][0] *= gain;
+                        out[idx][1] *= gain;
+                    }
+                }
+            }
+
+            // --- D. 3D IFFT ---
+            fftw_execute(p_inv);
+
+            // --- E. WOLA 重叠相加 ---
+            int target_t = 1; 
+            for (int dy = 0; dy < Ny; ++dy) {
+                if ((y + dy) >= height) continue;
+                for (int dx = 0; dx < Nx; ++dx) {
+                    if ((x + dx) >= width) continue;
+                    
+                    int idx = IDX3(target_t, dy, dx, Nt, Ny, Nx);
+                    double w = winT[target_t] * winY[dy] * winX[dx];
+                    double val = in[idx][0] / (double)(Nt * Ny * Nx);
+                    
+                    accChroma[y + dy][x + dx] += val * w;
+                    weightSum[y + dy][x + dx] += w * w;
+                }
             }
         }
     }
+
+    // =========================================================================
+    // 4. 写回结果 Write the results
+    // =========================================================================
+    for (int y = startY; y < height; ++y) {
+        for (int x = startX; x < width; ++x) {
+            double w = weightSum[y][x];
+            if (w > 0.00001) {
+                clpbuffer[2].pixel[y][x] = accChroma[y][x] / w;
+            } else {
+                clpbuffer[2].pixel[y][x] = clpbuffer[1].pixel[y][x];
+            }
+        }
+    }
+
+    // 清理 Cleanup
+    fftw_destroy_plan(p_fwd);
+    fftw_destroy_plan(p_inv);
+    fftw_free(in);
+    fftw_free(out);
 }
 
 // Evaluate all candidates for 3D decoding for a given position, and return the best one
